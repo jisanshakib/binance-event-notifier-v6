@@ -131,7 +131,11 @@ Return a JSON object matching the supplied schema with exactly these fields:
   Remove leading $ or # only; never add a $ prefix or uppercase a mixed-case name.
   For example, Swell stays Swell, not $Swell or SWELL.
   Prefer the campaign subject over incidental tickers, hashtags or eligibility services.
-  If the target is absent, return "N/A"; never invent it.
+  If the post uses unusual formatting or never says Booster/Campaign, use the
+  project/campaign name from the post's title or first few lines (e.g. the
+  first heading such as "Swell x Binance Wallet"), without emojis or filler
+  words like New, Live, Binance Wallet, Booster, Campaign.
+  Only if no name appears anywhere in the post, return "N/A"; never invent it.
 - alpha_points: the exact dynamic integer associated with the Alpha Points
   eligibility requirement, e.g. "1", "2", "61", or any other stated integer.
   Do not substitute reward amounts, dates, participant counts or an example number.
@@ -178,6 +182,15 @@ def normalize_event_type(v, text=None):
     return ""
 
 
+def fallback_event_type(text):
+    """Used only when Gemini gave no usable tag: read an explicit tag straight from the post."""
+    fcfs = bool(re.search(r"\b(?:fcfs|first[\s-]+come[\s-]+first[\s-]+served)\b", text or "", re.I))
+    every = bool(re.search(r"\ball\s+users?\b", text or "", re.I))
+    if fcfs != every:  # ambiguous (both or neither) -> no tag
+        return "FCFS users Event" if fcfs else "All user Event"
+    return ""
+
+
 def normalize_points(v):
     value = str(v if v is not None else "").strip()
     return str(int(value)) if re.fullmatch(r"[0-9]+", value) else "N/A"
@@ -205,7 +218,7 @@ def fallback_target(text):
     # Ignore URL paths and common non-target acronyms. Reject ambiguous matches
     # rather than attributing a campaign to a random ticker.
     text = re.sub(r"https?://\S+", " ", text or "")
-    excluded = {"FCFS", "USDT", "USDC", "BUSD", "USD", "UTC", "GMT", "APR", "APY", "NFT", "JSON", "API", "N", "NA"}
+    excluded = {"FCFS", "USDT", "USDC", "BUSD", "USD", "UTC", "GMT", "APR", "APY", "NFT", "JSON", "API", "N", "NA", "LIVE", "NEW", "NOW", "HOT", "ALL", "JOIN", "FREE", "SOON", "BNB", "BSC"}
     ticker = r"[A-Z]{2,8}(?![\w])"
     marked = re.findall(r"(?<!\w)[$#](" + ticker + r")", text)
     keyword = r"(?i:Booster|Campaign)"
@@ -216,7 +229,49 @@ def fallback_target(text):
     nearby = [x for x in candidates if x in near]
     if len(nearby) == 1:
         return nearby[0]
-    return candidates[0] if len(candidates) == 1 else ""
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        return ""
+    # Mixed-case names written right before Booster/Campaign, e.g. "Swell Booster Campaign".
+    generic = {"binance", "wallet", "the", "new", "this", "our", "a", "an", "alpha", "web3", "keyless", "booster", "campaign"}
+    names = [n for n in re.findall(r"(?<![\w$#])([A-Z][A-Za-z0-9-]{1,30})(?=[ \t]+(?:Booster|Campaign)\b)", text)
+             if n.casefold() not in generic and re.search(r"[a-z]", n)]  # all-caps words are handled above
+    names = list(dict.fromkeys(names))
+    return names[0] if len(names) == 1 else ""
+
+
+_HEADING_FILLER = {
+    "binance", "wallet", "binancewallet", "booster", "boosters", "campaign", "campaigns", "new", "live", "now",
+    "is", "are", "the", "a", "an", "and", "for", "with", "on", "in", "of", "to", "by", "x", "×", "join", "event",
+    "alpha", "points", "point", "web3", "keyless", "users", "user", "all", "fcfs", "first", "come", "served",
+    "announcement", "update", "reward", "rewards", "airdrop", "official", "exclusive", "only", "here", "this",
+    "our", "your", "get", "up", "free", "today", "launch", "launched", "launches", "starts", "started",
+}
+_HEADING_EXCLUDED = {"USDT", "USDC", "BUSD", "USD", "UTC", "GMT", "APR", "APY", "NFT", "BNB", "BSC"}
+
+
+def heading_name(text):
+    """Last-resort local fallback: the project name from the post's first few lines.
+    Removes links, emojis/symbols and filler words; returns '' when nothing name-like is left."""
+    for line in [l for l in (text or "").splitlines() if l.strip()][:3]:
+        line = re.sub(r"https?://\S+|\S+\.(?:com|org|io)\S*", " ", line)
+        words = re.findall(r"[^\W_][\w.'&+-]*", line)
+        kept = []
+        for w in words:
+            w = w.strip(".'&+-")
+            if (not w or w.casefold() in _HEADING_FILLER or w.upper() in _HEADING_EXCLUDED
+                    or not re.search(r"[A-Za-z]", w) or len(w) > 30):
+                if kept:
+                    break  # name = first run of meaningful words
+                continue
+            kept.append(w)
+        # tickers/hashtags were already judged by fallback_target; skip lines that are only those
+        if kept and not re.search(r"[$#]" + re.escape(kept[0]) + r"\b", line) and kept[0][0].isupper():
+            name = " ".join(kept[:4])
+            if 2 <= len(name) <= 40:
+                return name
+    return ""
 
 
 async def extract(text):
@@ -231,18 +286,19 @@ async def extract(text):
     points = normalize_points(data.get("alpha_points"))
     if points == "N/A":
         points = fallback_points(text)
-    target = clean_token(data.get("target_name")) or fallback_target(text)
+    target = clean_token(data.get("target_name")) or fallback_target(text) or heading_name(text)
     # Keep the existing internal formatter/publisher contract isolated from the
     # new Gemini field name; Gemini itself only returns target_name.
     return {"token": target,
-            "event_type": normalize_event_type(data.get("event_type"), text),
+            "event_type": normalize_event_type(data.get("event_type"), text) or fallback_event_type(text),
             "alpha_points": points}
 
 
 def build_post(d):
     # Campaign/project names are not necessarily tickers. Never force a $ prefix.
     name = clean_token(d.get("token"))
-    header = f"{name} × BinanceWallet Booster Campaign"
+    # No name found anywhere -> clean generic header instead of rejecting the post.
+    header = f"{name} × BinanceWallet Booster Campaign" if name else "BinanceWallet Booster Campaign"
     if d.get("event_type"):
         header += f" ~ {d['event_type']}"
     return (f"{header} 🔥✔️\n\n"
@@ -345,13 +401,11 @@ class Booster:
     async def _publish(self, msg, text, chat_name, dest):
         try:
             data = await extract(text)
-            if not data["token"]:
-                raise RuntimeError("টোকেন/ক্যাম্পেইনের নাম পাওয়া যায়নি")
             caption = build_post(data)
             target = telegram_entity(dest)
             if msg.photo or (msg.document and msg.file and (msg.file.mime_type or "").startswith(("image", "video"))):
                 with tempfile.TemporaryDirectory() as d:
-                    path = await self.user.download_media(msg, file=os.path.join(d, "media"))
+                    path = await asyncio.wait_for(self.user.download_media(msg, file=os.path.join(d, "media")), timeout=120)
                     if len(caption) <= 1024:
                         await self.bot.send_file(target, path, caption=caption, parse_mode=None)
                     else:
@@ -494,7 +548,7 @@ class Booster:
 
     async def on_button(self, event):
         try:
-            if event.sender_id != config.ADMIN_ID:
+            if not self._ok(event):
                 return await event.answer('⛔️ আপনার অনুমতি নেই', alert=True)
             await event.answer()
             name = event.data.decode()[2:]
@@ -514,7 +568,8 @@ class Booster:
                     await self.send(event, f'🗑 বাদ দেওয়া হয়েছে: {shown}' if ok else 'ℹ️ আগেই বাদ দেওয়া হয়েছে।')
                 return await self.show(event, sec)
             if name == 'toggle':
-                await asyncio.to_thread(db.set_setting, 'booster_enabled', '0' if is_enabled() else '1')
+                on = await asyncio.to_thread(is_enabled)
+                await asyncio.to_thread(db.set_setting, 'booster_enabled', '0' if on else '1')
                 name = 'menu'
             if name == 'destreset':
                 await asyncio.to_thread(db.set_setting, 'booster_destination', '')

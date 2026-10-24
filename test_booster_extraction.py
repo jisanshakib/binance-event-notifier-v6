@@ -163,3 +163,52 @@ class ExtractionTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ---- audit additions: Gemini missing/broken fields must fall back to the post text ----
+def _run_extract(raw, post):
+    import asyncio, booster
+    async def fake(_p):
+        if raw is None:
+            raise RuntimeError("Gemini down")
+        return raw
+    orig, booster.ask_gemini = booster.ask_gemini, fake
+    try:
+        return asyncio.run(booster.extract(post))
+    finally:
+        booster.ask_gemini = orig
+
+
+def test_audit_fcfs_tag_survives_missing_gemini_field():
+    assert _run_extract("{}", "Swell Booster Campaign. 61 Alpha Points. FCFS.")["event_type"] == "FCFS users Event"
+
+
+def test_audit_all_users_tag_when_gemini_down():
+    assert _run_extract(None, "ENA Booster Campaign open to all users, 2 Alpha Points")["event_type"] == "All user Event"
+
+
+def test_audit_no_tag_when_post_has_none():
+    assert _run_extract("{}", "ENA Booster Campaign, 2 Alpha Points")["event_type"] == ""
+
+
+def test_audit_mixed_case_name_when_gemini_down_no_dollar():
+    d = _run_extract(None, "Swell Booster Campaign is live! Requires 61 Alpha Points.")
+    assert d["token"] == "Swell" and d["alpha_points"] == "61"
+    import booster
+    assert booster.build_post(d).startswith("Swell × BinanceWallet Booster Campaign")
+
+
+# ---- name must never be "not found": heading fallback + generic default ----
+def test_heading_used_when_no_booster_keyword_and_gemini_down():
+    assert _run_extract(None, "📢 NEW: Lorenzo Protocol on Binance Wallet\n2 Alpha Points")["token"] == "Lorenzo Protocol"
+
+
+def test_filler_words_never_become_the_name():
+    assert _run_extract(None, "New Booster Campaign is LIVE!\nKelp DAO rewards for all users")["token"] == "Kelp DAO"
+
+
+def test_post_without_any_name_still_gets_clean_header():
+    import booster
+    d = _run_extract("{}", "🚀🚀🚀\nhttps://x.com")
+    assert d["token"] == ""
+    assert booster.build_post(d).startswith("BinanceWallet Booster Campaign")

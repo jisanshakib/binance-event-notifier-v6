@@ -465,8 +465,9 @@ def test_booster_failure_is_contained():
     reset(); B.add_keyword("booster")
     async def boom(p): raise RuntimeError("down")
     B.ask_gemini = boom
-    assert run(BOOST.process(msg(11, "Booster with 5 Alpha Points"), "c")) is False  # no token -> no crash
-    assert SENT[-1][1].startswith("❌ বুস্টার")
+    # Gemini down + no name -> still posted with the clean generic header, no crash
+    assert run(BOOST.process(msg(11, "Booster with 5 Alpha Points"), "c")) is True
+    assert SENT[-1][1].startswith("BinanceWallet Booster Campaign") and "5 Binance Alpha Points" in SENT[-1][1]
 
 
 def test_booster_own_destination_overrides_main():

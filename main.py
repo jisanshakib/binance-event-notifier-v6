@@ -108,7 +108,7 @@ async def _publish(msg, text, chat_name, dest):
         dest_entity = telegram_entity(dest)
         if msg.photo or (msg.document and msg.file and (msg.file.mime_type or "").startswith(("image", "video"))):
             with tempfile.TemporaryDirectory() as d:
-                path = await user.download_media(msg, file=os.path.join(d, "media"))
+                path = await asyncio.wait_for(user.download_media(msg, file=os.path.join(d, "media")), timeout=120)
                 if len(caption) <= 1024:
                     await bot.send_file(dest_entity, path, caption=caption, parse_mode="md")
                 else:
