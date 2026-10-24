@@ -445,7 +445,7 @@ def test_booster_normalizers():
 
 def test_booster_post_uses_own_keywords_and_never_main_pipeline():
     reset(); BOOST_AI.clear(); db.add_keyword("Booster")  # main keyword must NOT trigger booster
-    _boost_ai('{"token":"Swell","event_type":"","alpha_points":2}')
+    _boost_ai('{"target_name":"Swell","event_type":"","alpha_points":2}')
     run(BOOST.process(msg(10, "Swell Booster live https://www.binance.com/x"), "boostch"))
     assert SENT == [] and BOOST_AI == []
     B.add_keyword("booster")
@@ -471,8 +471,8 @@ def test_booster_failure_is_contained():
 
 def test_booster_own_destination_overrides_main():
     reset(); B.add_keyword("booster"); db.set_setting("booster_destination", "boostdest")
-    _boost_ai('{"token":"ENA","event_type":"All user Event","alpha_points":"N/A"}')
-    run(BOOST.process(msg(12, "ENA booster"), "c"))
+    _boost_ai('{"target_name":"ENA","event_type":"All user Event","alpha_points":"N/A"}')
+    run(BOOST.process(msg(12, "ENA booster — All user Event"), "c"))
     assert SENT[0][0] == "boostdest" and "~ All user Event" in SENT[0][1]
 
 

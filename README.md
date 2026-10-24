@@ -120,3 +120,31 @@ Swell × BinanceWallet Booster Campaign ~ FCFS users Event 🔥✔️
 - কমান্ড: `/addboosterchannel` `/delboosterchannel` `/addboosterkw` `/delboosterkw` `/setboosterdest` `/boostertest`
 - বুস্টারের আলাদা গন্তব্য না দিলে মূল গন্তব্য চ্যানেলেই পোস্ট যায়।
 - বুস্টারের যেকোনো ত্রুটি ভেতরেই ধরা হয়; মূল মডিউল কখনো থামে না।
+
+
+## v11 — Booster structured extraction
+- Gemini REST configuration uses `responseMimeType: application/json` and a
+  defined `responseSchema` (the REST equivalents of SDK `response_mime_type`
+  and `response_schema`), still on `gemini-2.5-flash`.
+- JSON fields: `target_name`, `event_type`, `alpha_points`. Target names may be
+  tickers, projects, companies or Binance services/products; leading $/# are removed.
+- The entire post is supplied, without the old 4,000-character cutoff.
+- Event types require explicit evidence in the original post, not just an AI guess.
+- Missing Alpha Points use N/A, with a local points fallback in either label order.
+- Missing/invalid names and AI errors use a local 2–8 letter uppercase ticker
+  fallback after $/# or near Booster/Campaign. Ambiguous matches remain blank
+  instead of selecting a random token; the existing failure notification applies.
+- `target_name` is mapped to the existing internal `token` field for the unchanged
+  caption format. Announcement extraction and all database tables are unchanged.
+- Run: `python test_bot.py` and `python -m unittest test_booster_extraction.py`.
+- These tests use fake Telegram, Gemini and database calls. Live Gemini accuracy
+  and Telegram delivery still need a real `/boostertest` after deployment.
+
+## v12 — Raw Booster campaign names
+- A ticker or dollar sign is not required. Gemini preserves the Campaign/Project
+  Name as written, including capitalization and meaningful Booster/Campaign words.
+- Local cleanup no longer deletes parts of campaign names. Leading $/# markers
+  are removed; the Booster formatter never adds a dollar prefix.
+- `Swell` displays as `Swell × BinanceWallet Booster Campaign`, not `$Swell`.
+- Existing entry, eligibility and event formatting remain unchanged. The
+  announcement module is untouched; live `/boostertest` verification is still needed.
