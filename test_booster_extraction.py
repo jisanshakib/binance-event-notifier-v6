@@ -29,7 +29,7 @@ class ExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(requests[0][0].endswith('gemini-2.5-flash:generateContent'))
         generation = requests[0][1]['generationConfig']
         self.assertEqual(generation['responseMimeType'], 'application/json')
-        self.assertEqual(set(generation['responseSchema']['required']), {'target_name', 'event_type', 'alpha_points'})
+        self.assertEqual(set(generation['responseSchema']['required']), {'target_name', 'reward_pool', 'event_type', 'alpha_points'})
         self.assertTrue(generation['responseSchema']['properties']['event_type']['nullable'])
 
     async def test_dollar_ticker(self):
@@ -245,3 +245,24 @@ def test_reward_line_only_when_present():
     import booster
     assert "🎁Reward Pool: 100,000 USDC" in booster.build_post(_run_extract(None, FLAP))
     assert "Reward" not in booster.build_post(_run_extract(None, "ENA Booster, 2 Alpha Points"))
+
+
+# ---- Gemini-first schema: target_name / reward_pool / alpha_points ----
+def test_gemini_fields_are_used_directly():
+    d = _run_extract('{"target_name":"TermMax","reward_pool":"2,000,000 TMX","alpha_points":61,"event_type":null}',
+                     "Participate in the TermMax Booster Campaign, share 2,000,000 TMX, 61 Alpha Points")
+    assert (d["token"], d["reward"], d["alpha_points"]) == ("TermMax", "2,000,000 TMX", "61")
+
+
+def test_gemini_nulls_become_na_not_boilerplate():
+    import booster
+    d = _run_extract('{"target_name":null,"reward_pool":null,"alpha_points":null,"event_type":null}', "🚀🚀🚀")
+    assert (d["token"], d["reward"], d["alpha_points"]) == ("", "", "N/A")
+    assert booster.build_post(d).startswith("BinanceWallet Booster Campaign")
+
+
+def test_intro_words_and_dollar_removed_from_gemini_name():
+    import booster
+    for raw, want in [("Participate in TermMax", "TermMax"), ("The Exclusive Swell Booster Campaign", "Swell"),
+                      ("$bStocks", "bStocks"), ("N/A", ""), ("Booster Campaign", "")]:
+        assert booster.clean_token(raw) == want, raw
