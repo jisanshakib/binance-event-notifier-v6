@@ -114,7 +114,7 @@ RESPONSE_SCHEMA = {
         "alpha_points": {"type": "INTEGER", "nullable": True,
                          "description": "Plain integer Binance Alpha Points requirement (2 for '2+ Alpha Points'). null when absent."},
         "event_type": {"type": "STRING", "nullable": True,
-                       "enum": ["FCFS users Event", "All user Event", ""],
+                       "enum": ["FCFS users Event", "All user Event"],
                        "description": "Only an explicitly stated audience type; null or empty when absent."},
     },
     "required": ["target_name", "reward_pool", "alpha_points", "event_type"],
@@ -128,19 +128,21 @@ Return a JSON object matching the supplied schema. For any field that is not
 clearly stated in the post, return null. Never guess, and never fill a field
 with boilerplate words.
 
-1. target_name — the core project or brand name the booster campaign is for.
-   Examples: "Participate in the TermMax Booster Campaign" -> "TermMax";
-   "Join the exclusive Swell Booster" -> "Swell";
-   "bStocks x Flap Booster Campaign" -> "bStocks x Flap" (keep a collaboration
-   exactly as written).
-   - Remove introductory/filler words: Participate, Join, The, Exclusive, New,
-     Live, Now, Official, Introducing, Announcing, Binance, Binance Wallet,
-     Keyless Wallet, Booster, Campaign, Event.
-   - Keep the original spelling and capitalization (bStocks stays bStocks,
-     Swell stays Swell — not SWELL).
-   - Do NOT add a $ sign; remove a leading $ or #.
-   - Do not return reward assets (USDC, USDT), "Alpha Points", or dates.
-   - If the post has no project/brand name, return null.
+1. target_name — read the WHOLE post and find the exact Project / Brand Name
+   the Booster Campaign is for (e.g. TermMax, bStocks, Swell).
+   STRICT RULE: ignore verbs and boilerplate words such as Participate, Join,
+   Enter, Introducing, Announcing, The, A, An, Exclusive, New, Live, Now,
+   Official, Binance, Binance Wallet, Keyless Wallet, Booster, Campaign, Event.
+   Examples:
+     "Participate in TermMax Booster Campaign"        -> "TermMax"
+     "Join the Exclusive Swell Booster Campaign"      -> "Swell"
+     "LIVE: bStocks x Flap Booster Campaign"          -> "bStocks x Flap"
+     "The new Booster Campaign is live, 2 Alpha Points" -> "N/A"
+   - Keep the brand's own spelling and capitalization (bStocks, not BSTOCKS).
+   - Never add a $ sign; remove a leading $ or #.
+   - Never return a reward asset (USDC, USDT, BNB), "Alpha Points", a date or
+     a number as the name.
+   - If no real project/brand name is present, return "N/A". Do not guess.
 
 2. reward_pool — the total reward pool, exactly as written with its amount and
    asset, e.g. "2,000,000 TMX", "100,000 USDC", "$50,000 worth of FLAP".
@@ -164,26 +166,80 @@ with boilerplate words.
 {post}
 </telegram_post>
 """
+SYSTEM_INSTRUCTION = """You are a precise data-extraction engine for Binance Booster Campaign posts.
+Analyze the full Telegram post you are given and return only the requested JSON.
+
+How to find target_name: the project/brand name is usually the word(s) right
+after "in", "with", "for" or "on" and right before "Booster" / "Booster Campaign",
+e.g. "Participate in TermMax Booster Campaign" -> TermMax,
+"Trade with bStocks Booster Campaign" -> bStocks. Never return the verb or
+introductory word itself (Participate, Join, The, Exclusive, Live ...).
+
+Before returning the JSON, do a self-correction pass on target_name:
+1. Remove any verbs or boilerplate words it still contains: Participate, Join,
+   Enter, Introducing, Announcing, The, A, An, Exclusive, New, Live, Now,
+   Official, Binance, Binance Wallet, Keyless Wallet, Booster, Campaign, Event.
+2. Remove any $ or # sign and surrounding punctuation or emojis.
+3. Check what is left is a real project/brand name that appears in the post
+   (e.g. TermMax, bStocks, Swell), with its original capitalization.
+4. If nothing valid is left, set target_name to "N/A". Never guess a word.
+For every other field, return "N/A" or null when it is not clearly stated.
+"""
+
 _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
+async def _gemini_call(prompt, schema):
+    gen = {"temperature": 0, "responseMimeType": "application/json"}
+    if schema:
+        gen["responseSchema"] = RESPONSE_SCHEMA
+    async with httpx.AsyncClient(timeout=27) as client:
+        return await client.post(
+            _GEMINI_URL.format(model=config.GEMINI_MODEL),
+            headers={"x-goog-api-key": config.GEMINI_API_KEY, "Content-Type": "application/json"},
+            json={"systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+                  "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                  "generationConfig": gen})
+
+
 async def ask_gemini(prompt):
+    schema = True
     for attempt in (1, 2):
-        async with httpx.AsyncClient(timeout=27) as client:
-            r = await client.post(
-                _GEMINI_URL.format(model=config.GEMINI_MODEL),
-                headers={"x-goog-api-key": config.GEMINI_API_KEY, "Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 0, "responseMimeType": "application/json",
-                                           "responseSchema": RESPONSE_SCHEMA}})
-        if r.status_code in (429, 500, 502, 503, 504) and attempt == 1:
+        r = await _gemini_call(prompt, schema)
+        if attempt == 1 and r.status_code in (429, 500, 502, 503, 504):
             await asyncio.sleep(4)
+            continue
+        if attempt == 1 and r.status_code == 400 and "schema" in r.text.lower():
+            print("Gemini rejected the schema, retrying in plain JSON mode:", r.text[:300])
+            schema = False
             continue
         break
     if r.status_code != 200:
         raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
-    parts = (r.json().get("candidates") or [{}])[0].get("content", {}).get("parts", [])
-    return "".join(p.get("text", "") for p in parts)
+    body = r.json()
+    cand = (body.get("candidates") or [{}])[0]
+    parts = cand.get("content", {}).get("parts", [])
+    text = "".join(p.get("text", "") for p in parts)
+    if not text.strip():
+        raise RuntimeError(f"Gemini returned no text (finishReason={cand.get('finishReason')})")
+    return text
+
+
+def _parse_gemini_json(raw):
+    """Accept plain JSON or JSON wrapped in ```json fences / extra text."""
+    raw = (raw or "").strip()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            raise
+        data = json.loads(m.group(0))
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        data = data[0]
+    if not isinstance(data, dict):
+        raise ValueError("Gemini JSON is not an object")
+    return data
 
 
 def normalize_event_type(v, text=None):
@@ -234,7 +290,6 @@ def fallback_points(text):
         qual + r"([0-9]{1,6})" + _PTS_SYM + r"points?\b",                          # at least 15 points
         r"(?:deduct(?:s|ed|ing)?|consum(?:e|es|ed|ing)|cost(?:s)?|spend(?:s)?|use(?:s)?)\s+"
         + r"([0-9]{1,6})" + _PTS_SYM + r"(?:alpha\s+)?points?\b",                 # deduct 2 points
-        _PTS_NUM + _PTS_SYM + r"points?\b",                                        # any '2 points' as a last resort
     ]
     for p in patterns:
         m = re.search(p, t, re.I)
@@ -262,21 +317,42 @@ def fallback_reward(text):
     return ""
 
 
+JUNK_WORDS = {
+    "participate", "participating", "join", "joining", "enter", "trade", "deposit", "stake", "hold", "complete",
+    "introducing", "announcing", "presenting", "welcome", "discover", "explore", "check", "get", "win", "earn",
+    "the", "a", "an", "in", "with", "for", "on", "of", "to", "and", "at", "via", "by", "from", "this", "our", "your",
+    "exclusive", "new", "live", "now", "official", "latest", "upcoming", "special", "limited", "exciting", "hot",
+    "binance", "wallet", "binancewallet", "keyless", "web3", "booster", "boosters", "campaign", "campaigns",
+    "event", "events", "is", "are", "alpha", "points", "point", "reward", "rewards", "airdrop", "all", "users",
+    "user", "fcfs", "usdc", "usdt", "busd", "bnb", "x", "×", "&", "-", "–", ":", "|",
+}
+
+
+def _is_junk(word):
+    return word.strip(".,:;!?()[]'\"").casefold() in JUNK_WORDS
+
+
 def clean_token(v):
     if not isinstance(v, str):
         return ""
-    v = v.strip().lstrip("$#").strip()
-    # Safety net if Gemini still keeps intro/boilerplate words around the name.
-    v = re.sub(r"(?i)^(?:(?:participate|join|introducing|announcing)(?:\s+in)?|the|an?|exclusive|new|live|now|official)\s+", "", v)
-    v = re.sub(r"(?i)^(?:(?:the|exclusive|new|official)\s+)+", "", v)
-    # Strip a trailing "Booster Campaign" only when a real brand name stays in front of it,
-    # so Binance product names such as "Binance Wallet Booster Campaign" are kept.
-    core = re.sub(r"(?i)\s+(?:booster(?:\s+campaign)?|campaign)$", "", v).strip()
-    if core and not re.fullmatch(r"(?i)(?:binance\s*)?(?:web3\s+|keyless\s+)?wallet|binance", core):
-        v = core
-    v = v.lstrip("$#").strip()
+    v = " ".join(v.replace("\n", " ").split()).strip().strip("\"'`*_").lstrip("$#").strip()
+    # Binance's own products are valid campaign names and are kept as written
+    # (e.g. "Web3 Wallet", "Binance Wallet", "Binance Wallet Booster Campaign").
+    if re.fullmatch(r"(?i)(?:binance\s+)?(?:(?:web3|keyless)\s+)?wallet(?:\s+booster(?:\s+campaign)?)?", v):
+        return v
+    # Safety net: drop verbs/boilerplate Gemini may have left at either end
+    # ("Participate in TermMax" -> "TermMax", "Swell Booster Campaign" -> "Swell").
+    words = v.split()
+    while words and _is_junk(words[0]):
+        words.pop(0)
+    while words and _is_junk(words[-1]):
+        words.pop()
+    v = " ".join(words).strip(".,:;!?-–|").lstrip("$#").strip()
+    if not v or not re.search(r"[A-Za-z]", v) or all(_is_junk(w) for w in v.split()):
+        return ""
     if v.casefold() in ("", "n/a", "na", "none", "null", "unknown", "not found",
-                        "booster", "campaign", "booster campaign", "alpha points"):
+                        "booster", "campaign", "booster campaign", "alpha points", "participate", "join",
+                        "the", "exclusive", "live", "new", "now", "official", "event", "usdc", "usdt", "bnb"):
         return ""
     return v
 
@@ -301,11 +377,10 @@ def fallback_target(text):
     if candidates:
         return ""
     # Mixed-case names written right before Booster/Campaign, e.g. "Swell Booster Campaign".
-    generic = {"binance", "wallet", "the", "new", "this", "our", "a", "an", "alpha", "web3", "keyless", "booster", "campaign"}
     # Also keeps collaborations whole: "bStocks x Flap Booster Campaign" -> "bStocks x Flap".
     word = r"[A-Za-z][A-Za-z0-9-]{1,30}"
     names = [n for n in re.findall(r"(?<![\w$#])((?:" + word + r"[ \t]+(?:x|X|×|&)[ \t]+)*" + word + r")(?=[ \t]+(?:Booster|Campaign)\b)", text)
-             if n.split()[-1].casefold() not in generic and re.search(r"[a-z]", n) and re.search(r"[A-Z]", n)]
+             if not _is_junk(n.split()[-1]) and not _is_junk(n.split()[0]) and re.search(r"[a-z]", n) and re.search(r"[A-Z]", n)]
     names = list(dict.fromkeys(names))
     return names[0] if len(names) == 1 else ""
 
@@ -344,24 +419,26 @@ def heading_name(text):
 
 
 async def extract(text):
-    data = {}
+    """Gemini does the parsing. Local checks are strict safety nets only:
+    an explicit $TICKER / #TICKER / 'NAME Booster' for the name, a number labelled as
+    (Alpha) points, and a reward amount with its coin. Nothing is guessed from loose words."""
+    data, ai_error = {}, ""
     try:
+        # The full post text goes to Gemini unchanged.
         raw = await asyncio.wait_for(ask_gemini(PROMPT.format(post=text or "")), timeout=60)
-        data = json.loads(raw or "{}")
-        if not isinstance(data, dict):
-            data = {}
+        data = _parse_gemini_json(raw)
     except Exception as e:
+        ai_error = str(e)[:300] or e.__class__.__name__
         print("Booster AI error:", repr(e))
     points = normalize_points(data.get("alpha_points"))
     if points == "N/A":
         points = fallback_points(text)
-    target = clean_token(data.get("target_name")) or fallback_target(text) or heading_name(text)
-    # Keep the existing internal formatter/publisher contract isolated from the
-    # new Gemini field name; Gemini itself only returns target_name.
+    target = clean_token(data.get("target_name")) or fallback_target(text)
     return {"token": target,
             "event_type": normalize_event_type(data.get("event_type"), text) or fallback_event_type(text),
             "alpha_points": points,
-            "reward": clean_reward(data.get("reward_pool") or data.get("reward")) or fallback_reward(text)}
+            "reward": clean_reward(data.get("reward_pool") or data.get("reward")) or fallback_reward(text),
+            "ai_error": ai_error}
 
 
 def build_post(d):
@@ -472,6 +549,8 @@ class Booster:
     async def _publish(self, msg, text, chat_name, dest):
         try:
             data = await extract(text)
+            if data.get("ai_error"):
+                await self.notify_admin(f"⚠️ বুস্টার: Gemini উত্তর দেয়নি ({chat_name}/{msg.id}), তাই শুধু নিশ্চিত তথ্য দিয়ে পোস্ট করা হচ্ছে। কারণ: {data['ai_error'][:300]}")
             caption = build_post(data)
             target = telegram_entity(dest)
             if msg.photo or (msg.document and msg.file and (msg.file.mime_type or "").startswith(("image", "video"))):

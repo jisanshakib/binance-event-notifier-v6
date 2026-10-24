@@ -121,7 +121,7 @@ class ExtractionTests(unittest.IsolatedAsyncioTestCase):
         async def fail(prompt): raise RuntimeError('offline')
         with patch.object(B, 'ask_gemini', fail):
             d = await B.extract('$SWELL Booster requires 61 Alpha Points')
-        self.assertEqual(d, {'token': 'SWELL', 'event_type': '', 'alpha_points': '61', 'reward': ''})
+        self.assertEqual(d, {'token': 'SWELL', 'event_type': '', 'alpha_points': '61', 'reward': '', 'ai_error': 'offline'})
 
     async def test_malformed_or_non_object_json_uses_fallback(self):
         for answer in ('not JSON', 'null', '[]', '{broken', '```json\n{}\n```'):
@@ -199,12 +199,14 @@ def test_audit_mixed_case_name_when_gemini_down_no_dollar():
 
 
 # ---- name must never be "not found": heading fallback + generic default ----
-def test_heading_used_when_no_booster_keyword_and_gemini_down():
-    assert _run_extract(None, "📢 NEW: Lorenzo Protocol on Binance Wallet\n2 Alpha Points")["token"] == "Lorenzo Protocol"
+def test_no_loose_first_line_guess_when_gemini_down():
+    # Without Gemini, a name is only taken from an explicit $TICKER / #TICKER / "Name Booster".
+    assert _run_extract(None, "📢 NEW: Lorenzo Protocol on Binance Wallet\n2 Alpha Points")["token"] == ""
 
 
 def test_filler_words_never_become_the_name():
-    assert _run_extract(None, "New Booster Campaign is LIVE!\nKelp DAO rewards for all users")["token"] == "Kelp DAO"
+    assert _run_extract(None, "New Booster Campaign is LIVE!\nKelp DAO rewards for all users")["token"] == ""
+    assert _run_extract(None, "Exclusive Booster Campaign for Participate users")["token"] == ""
 
 
 def test_post_without_any_name_still_gets_clean_header():
@@ -266,3 +268,82 @@ def test_intro_words_and_dollar_removed_from_gemini_name():
     for raw, want in [("Participate in TermMax", "TermMax"), ("The Exclusive Swell Booster Campaign", "Swell"),
                       ("$bStocks", "bStocks"), ("N/A", ""), ("Booster Campaign", "")]:
         assert booster.clean_token(raw) == want, raw
+
+
+# ---- Gemini is the authority on the name ----
+def test_system_instruction_and_full_post_are_sent():
+    import asyncio, booster
+    seen = {}
+    class R:
+        status_code = 200; text = ""
+        def json(self): return {"candidates": [{"content": {"parts": [{"text": '{"target_name":"TermMax"}'}]}}]}
+    class C:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, headers=None, json=None): seen.update(json); return R()
+    post = "Participate in TermMax Booster Campaign\nline two\nline three with 61 Alpha Points"
+    orig, booster.httpx.AsyncClient = booster.httpx.AsyncClient, C
+    try:
+        d = asyncio.run(booster.extract(post))
+    finally:
+        booster.httpx.AsyncClient = orig
+    assert "self-correction" in seen["systemInstruction"]["parts"][0]["text"]
+    assert post in seen["contents"][0]["parts"][0]["text"]
+    assert d["token"] == "TermMax"
+
+
+def test_gemini_na_is_respected_no_random_word():
+    assert _run_extract('{"target_name":"N/A"}', "Exciting Rewards await everyone\nBooster live")["token"] == ""
+
+
+def test_junk_only_name_from_gemini_becomes_na():
+    assert _run_extract('{"target_name":"Participate"}', "Participate now in the Booster!")["token"] == ""
+
+
+
+# ---- critical bug: verbs/intro words must never become the name ----
+import pytest
+
+
+@pytest.mark.parametrize("gemini_name,want", [
+    ("Participate", ""), ("Participate in TermMax", "TermMax"), ("Join the Exclusive Swell", "Swell"),
+    ("LIVE: bStocks", "bStocks"), ("TermMax Booster Campaign", "TermMax"), ("The", ""), ("N/A", ""),
+    ("bStocks x Flap", "bStocks x Flap"), ("Web3 Wallet", "Web3 Wallet"),
+])
+def test_gemini_name_cleanup(gemini_name, want):
+    import json
+    assert _run_extract(json.dumps({"target_name": gemini_name}), "post")["token"] == want
+
+
+def test_termmax_post_when_gemini_down_uses_name_before_booster():
+    d = _run_extract(None, "Participate in TermMax Booster Campaign to share 2,000,000 TMX! 2+ Alpha Points required.")
+    assert (d["token"], d["reward"], d["alpha_points"]) == ("TermMax", "2,000,000 TMX", "2")
+
+
+def test_gemini_json_inside_code_fence_is_read():
+    d = _run_extract('```json\n{"target_name":"TermMax","reward_pool":"2,000,000 TMX","alpha_points":2}\n```', "x")
+    assert (d["token"], d["reward"], d["alpha_points"], d["ai_error"]) == ("TermMax", "2,000,000 TMX", "2", "")
+
+
+def test_random_number_not_labelled_points_is_not_used():
+    assert _run_extract(None, "ENA Booster, 500 winners, 30 days")["alpha_points"] == "N/A"
+
+
+def test_schema_rejected_retries_without_schema():
+    import asyncio, booster
+    calls = []
+    class R:
+        def __init__(self, code, body): self.status_code, self._b, self.text = code, body, str(body)
+        def json(self): return self._b
+    async def fake_call(prompt, schema):
+        calls.append(schema)
+        if schema:
+            return R(400, {"error": "Invalid JSON payload: responseSchema enum"})
+        return R(200, {"candidates": [{"content": {"parts": [{"text": '{"target_name":"TermMax"}'}]}}]})
+    orig, booster._gemini_call = booster._gemini_call, fake_call
+    try:
+        assert asyncio.run(booster.extract("Participate in TermMax Booster"))["token"] == "TermMax"
+    finally:
+        booster._gemini_call = orig
+    assert calls == [True, False]
