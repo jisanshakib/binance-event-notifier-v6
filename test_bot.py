@@ -290,7 +290,7 @@ def test_button_channel_and_keyword_crud_round_trip():
     reset(); c = main.controls; original = c.user; double = UserDouble(); c.user = double
     async def flow():
         start = AdminEvent('/start'); await c.on_command(start)
-        assert len(start.replies[0][1]['buttons']) == 3
+        assert len(start.replies[0][1]['buttons']) == 4
         await c.on_button(AdminEvent(data=b'm:channels'))
         await c.on_button(AdminEvent(data=b'p:addchannel'))
         await c.on_input(AdminEvent('https://t.me/ChannelName'))
@@ -387,6 +387,133 @@ def test_channel_list_is_not_cut_off():
     e = AdminEvent(data=b'a:channels'); run(main.controls.on_button(e))
     assert all(len(t.encode('utf-16-le')) // 2 <= 4096 for t, _ in e.replies)
     assert '@channel_399' in ''.join(t for t, _ in e.replies)
+
+
+# ---------------- Booster Campaign ----------------
+import booster as B  # noqa: E402
+def _install_fake_booster():
+    d = FAKE.data
+    B.get_channels = lambda: list(d.setdefault("b_ch", []))
+    def ac(c):
+        c = B.normalize_channel(c); l = d.setdefault("b_ch", [])
+        if c not in l: l.append(c)
+    B.add_channel = ac
+    def rc(c):
+        c = B.normalize_channel(c); l = d.setdefault("b_ch", [])
+        if c in l: l.remove(c); return True
+        return False
+    B.remove_channel = rc
+    B.get_keywords = lambda: list(d.setdefault("b_kw", []))
+    def ak(w):
+        w = B._kw(w); l = d.setdefault("b_kw", [])
+        if not w or any(x.lower() == w.lower() for x in l): return False
+        l.append(w); return True
+    B.add_keyword = ak
+    def rk(w):
+        l = d.setdefault("b_kw", []); n = len(l); l[:] = [x for x in l if x.lower() != B._kw(w).lower()]; return len(l) < n
+    B.remove_keyword = rk
+    def claim(c, m):
+        s = d.setdefault("b_posts", {})
+        if (c, m) in s: return False
+        s[(c, m)] = "processing"; return True
+    B.claim_post = claim
+    B.log_post = lambda c, m, st, o=None, e=None: d.setdefault("b_posts", {}).__setitem__((c, m), st)
+_install_fake_booster()
+BOOST = B.Booster(main.bot, main.user, main.notify_admin); BOOST.peer = main.controls
+BOOST_AI = []
+def _boost_ai(answer):
+    async def f(prompt): BOOST_AI.append(prompt); return answer
+    B.ask_gemini = f
+
+
+def test_booster_template_with_and_without_event_type():
+    a = B.build_post({"token": "Swell", "event_type": "FCFS users Event", "alpha_points": "61"})
+    assert a.splitlines()[0] == "Swell × BinanceWallet Booster Campaign ~ FCFS users Event 🔥✔️"
+    assert "🟢Entry: Binance Wallet App → Homepage Banner or Discover → Booster" in a
+    assert a.endswith("⚡️Eligibility: Binance Keyless Wallet users with at least 61 Binance Alpha Points")
+    b = B.build_post({"token": "ENA", "event_type": "", "alpha_points": "N/A"})
+    assert b.splitlines()[0] == "ENA × BinanceWallet Booster Campaign 🔥✔️"
+    assert "at least N/A Binance" in b
+
+
+def test_booster_normalizers():
+    assert B.normalize_event_type("") == "" and B.normalize_event_type(None) == "" and B.normalize_event_type("None") == ""
+    assert B.normalize_event_type("FCFS users Event") == "FCFS users Event"
+    assert B.normalize_event_type("All user Event") == "All user Event"
+    assert B.normalize_points(2) == "2" and B.normalize_points("N/A") == "N/A" and B.normalize_points(None) == "N/A"
+
+
+def test_booster_post_uses_own_keywords_and_never_main_pipeline():
+    reset(); BOOST_AI.clear(); db.add_keyword("Booster")  # main keyword must NOT trigger booster
+    _boost_ai('{"token":"Swell","event_type":"","alpha_points":2}')
+    run(BOOST.process(msg(10, "Swell Booster live https://www.binance.com/x"), "boostch"))
+    assert SENT == [] and BOOST_AI == []
+    B.add_keyword("booster")
+    orig = main.scrape; main.scrape = lambda u: (_ for _ in ()).throw(AssertionError("scraped"))
+    try:
+        run(BOOST.process(msg(10, "Swell Booster live https://www.binance.com/x"), "boostch"))
+        run(BOOST.process(msg(10, "Swell Booster live"), "boostch"))  # duplicate -> once
+    finally:
+        main.scrape = orig
+    assert len(SENT) == 1 and SENT[0][0] == "dest"
+    assert SENT[0][1].startswith("Swell × BinanceWallet Booster Campaign 🔥✔️")
+    assert "at least 2 Binance Alpha Points" in SENT[0][1]
+    assert AI_CALLS == [] and FAKE.data.get("processed_posts", []) == []
+
+
+def test_booster_failure_is_contained():
+    reset(); B.add_keyword("booster")
+    async def boom(p): raise RuntimeError("down")
+    B.ask_gemini = boom
+    assert run(BOOST.process(msg(11, "Booster with 5 Alpha Points"), "c")) is False  # no token -> no crash
+    assert SENT[-1][1].startswith("❌ বুস্টার")
+
+
+def test_booster_own_destination_overrides_main():
+    reset(); B.add_keyword("booster"); db.set_setting("booster_destination", "boostdest")
+    _boost_ai('{"token":"ENA","event_type":"All user Event","alpha_points":"N/A"}')
+    run(BOOST.process(msg(12, "ENA booster"), "c"))
+    assert SENT[0][0] == "boostdest" and "~ All user Event" in SENT[0][1]
+
+
+def test_booster_channel_links_accepted_via_ui():
+    reset(); BOOST.user = UserDouble()
+    for v in ["@BoostCh", "t.me/boostch", "https://t.me/boostch"]:
+        run(BOOST.action(AdminEvent(), "addboosterchannel", v))
+    assert B.get_channels() == ["boostch"] and db.get_channels() == []
+
+
+def test_tap_delete_buttons_remove_channel_and_keyword():
+    reset(); db.add_channel("chan_one"); db.add_keyword("Airdrop")
+    e = AdminEvent(data=b'a:channels'); run(main.controls.on_button(e))
+    from channel_refs import short_hash as h
+    data = f'x:c:0:{h("chan_one")}'.encode()
+    assert any(b.data == data for row in e.replies[-1][1]['buttons'] for b in row)
+    run(main.controls.on_button(AdminEvent(data=data))); assert db.get_channels() == []
+    run(main.controls.on_button(AdminEvent(data=f'x:k:0:{h("Airdrop")}'.encode()))); assert db.get_keywords() == []
+    B.add_channel("boostch"); B.add_keyword("booster")
+    run(BOOST.on_button(AdminEvent(data=f'b:x:c:0:{h("boostch")}'.encode()))); assert B.get_channels() == []
+    run(BOOST.on_button(AdminEvent(data=f'b:x:k:0:{h("booster")}'.encode()))); assert B.get_keywords() == []
+    assert db.get_channels() == [] and db.get_keywords() == []
+
+
+
+def test_stale_delete_button_never_removes_wrong_item():
+    from channel_refs import short_hash as h
+    reset(); db.add_keyword("A"); db.add_keyword("B"); db.remove_keyword("A")
+    run(main.controls.on_button(AdminEvent(data=f'x:k:0:{h("A")}'.encode())))
+    assert db.get_keywords() == ["B"]
+
+
+def test_only_one_menu_waits_for_typed_input():
+    reset(); c = main.controls
+    run(BOOST.on_button(AdminEvent(data=b'b:p:addboosterkw'))); run(c.on_button(AdminEvent(data=b'p:addkw')))
+    run(BOOST.on_other_button(AdminEvent(data=b'p:addkw')))
+    e = AdminEvent('Swell'); run(c.on_input(e)); run(BOOST.on_input(e))
+    assert db.get_keywords() == ["Swell"] and B.get_keywords() == []
+    reset(); run(c.on_button(AdminEvent(data=b'p:addkw'))); run(BOOST.on_button(AdminEvent(data=b'b:p:addboosterkw')))
+    e = AdminEvent('Swell'); run(c.on_input(e)); run(BOOST.on_input(e))
+    assert db.get_keywords() == [] and B.get_keywords() == ["Swell"]
 
 
 if __name__ == "__main__":

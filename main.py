@@ -159,6 +159,15 @@ async def on_channel_post(event):
 from admin_controls import AdminControls
 controls = AdminControls(bot, user, process_message).register()
 
+# ---------------- Booster Campaign (isolated module) ----------------
+try:
+    from booster import Booster
+    booster = Booster(bot, user, notify_admin).register()
+    booster.peer = controls
+except Exception:
+    traceback.print_exc()
+    booster = None
+
 
 async def main():
     threading.Thread(target=run_web, daemon=True).start()
@@ -172,6 +181,8 @@ async def main():
             await user(JoinChannelRequest(telegram_entity(ch)))
         except Exception as ex:
             print("join failed", ch, ex)
+    if booster:
+        await booster.startup()  # failures are caught inside; never blocks the main module
     print("Bot running...")
     await notify_admin("🚀 বট চালু হয়েছে। মেনু খুলতে /start পাঠান।")
     await asyncio.gather(user.run_until_disconnected(), bot.run_until_disconnected())

@@ -102,3 +102,21 @@ Dates are calculated in code (first UTC time = start, second = end), not by the 
 - If the article page or the AI fails, the bot still posts using the channel text and logs the fallback. Publishing errors notify the owner.
 - Keywords match whole words, case-insensitive (`list` matches "Will LIST", not "Listing").
 - Run tests: `python test_bot.py`
+
+
+## 🚀 বুস্টার ক্যাম্পেইন (Booster Campaign) — আলাদা মডিউল
+- মূল ঘোষণা ব্যবস্থা থেকে সম্পূর্ণ আলাদা: নিজস্ব টেবিল `booster_channels`, `booster_keywords`, `booster_posts` (চালু হলে নিজে থেকেই তৈরি হয়)।
+- কোনো লিংক খোলে বা স্ক্র্যাপ করে না; শুধু বুস্টার চ্যানেলের পোস্টের লেখা Gemini (`gemini-2.5-flash`)-কে পাঠায়।
+- Gemini বের করে: টোকেন/ক্যাম্পেইনের নাম, ইভেন্টের ধরন (FCFS users Event / All user Event — স্পষ্ট লেখা না থাকলে বাদ), Alpha Points (না থাকলে N/A)।
+- আউটপুট (ছবি থাকলে ছবিসহ):
+```
+Swell × BinanceWallet Booster Campaign ~ FCFS users Event 🔥✔️
+
+🟢Entry: Binance Wallet App → Homepage Banner or Discover → Booster
+
+⚡️Eligibility: Binance Keyless Wallet users with at least 61 Binance Alpha Points
+```
+- মেনু: /start → 🚀 বুস্টার ক্যাম্পেইন, অথবা /booster। চ্যানেল, কিওয়ার্ড, গন্তব্য, চালু/বন্ধ, অবস্থা, টেস্ট — সব বাটনে।
+- কমান্ড: `/addboosterchannel` `/delboosterchannel` `/addboosterkw` `/delboosterkw` `/setboosterdest` `/boostertest`
+- বুস্টারের আলাদা গন্তব্য না দিলে মূল গন্তব্য চ্যানেলেই পোস্ট যায়।
+- বুস্টারের যেকোনো ত্রুটি ভেতরেই ধরা হয়; মূল মডিউল কখনো থামে না।

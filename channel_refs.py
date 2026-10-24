@@ -44,3 +44,9 @@ def parse_post_link(value):
     public = re.fullmatch(r'([A-Za-z][A-Za-z0-9_]{3,31})/([1-9]\d*)', path)
     if public: return normalize_channel(public[1]), int(public[2])
     raise ValueError('একটি পোস্টের লিংক দিন: https://t.me/channelname/123 অথবা https://t.me/c/123456/789')
+
+
+def short_hash(value):
+    """8-char fingerprint so a ❌ button only deletes the exact item it was shown for."""
+    import hashlib
+    return hashlib.sha1(str(value).lower().encode()).hexdigest()[:8]

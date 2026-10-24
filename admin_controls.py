@@ -7,7 +7,7 @@ from telethon.errors import MessageNotModifiedError
 from telethon.tl.functions.channels import JoinChannelRequest
 import config
 import db
-from channel_refs import display_channel, normalize_channel, parse_post_link, telegram_entity
+from channel_refs import short_hash, display_channel, normalize_channel, parse_post_link, telegram_entity
 
 HELP = '''❓ সাহায্য ও নির্দেশনা
 /start – প্রধান মেনু
@@ -22,6 +22,7 @@ HELP = '''❓ সাহায্য ও নির্দেশনা
 /test https://t.me/channel/123 – একটি পোস্ট পরীক্ষা করুন
 /status – বটের অবস্থা
 /cancel – চলমান কাজ বাতিল করুন
+/booster – 🚀 বুস্টার ক্যাম্পেইন মেনু (আলাদা চ্যানেল ও কিওয়ার্ড)
 
 বাটন চাপুন, তারপর চাওয়া তথ্য পাঠান। চ্যানেল হিসেবে @username, t.me/channelname, https://t.me/channelname বা -100… আইডি দিন। ব্যক্তিগত চ্যানেলে আপনার Telegram অ্যাকাউন্ট আগে যুক্ত থাকতে হবে।
 গন্তব্য চ্যানেলে বটকে Admin বানিয়ে Post Messages অনুমতি দিন। অন্তত একটি কিওয়ার্ড যোগ করুন; কিওয়ার্ড না থাকলে স্বয়ংক্রিয় পোস্ট বন্ধ থাকবে।
@@ -41,6 +42,7 @@ def back(): return [button('⬅️ মূল মেনু', 'm:main')]
 def main_menu():
     return [[button('📢 চ্যানেল', 'm:channels'), button('🔑 কিওয়ার্ড', 'm:keywords')],
             [button('🎯 গন্তব্য চ্যানেল', 'm:dest'), button('📊 বটের অবস্থা', 'a:status')],
+            [button('🚀 বুস্টার ক্যাম্পেইন', 'b:menu')],
             [button('🧪 ম্যানুয়াল টেস্ট', 'p:test'), button('❓ সাহায্য', 'a:help')]]
 
 
@@ -102,7 +104,14 @@ class AdminControls:
             dest = await asyncio.to_thread(db.get_setting, 'destination')
             text = f'📊 বটের অবস্থা\n✅ চালু আছে\nচ্যানেল: {len(channels)}টি\nকিওয়ার্ড: {len(kws)}টি\nগন্তব্য: {display_channel(dest) if dest else "ঠিক করা হয়নি"}\nAI: Gemini ({config.GEMINI_MODEL})'
         else: return
-        await self.send(event, text, section_menu(name) if name in ('channels', 'keywords', 'dest') else [back()])
+        buttons = section_menu(name) if name in ('channels', 'keywords', 'dest') else [back()]
+        if name in ('channels', 'keywords') and values:
+            tag = 'c' if name == 'channels' else 'k'
+            label = display_channel if name == 'channels' else (lambda v: v)
+            rows = [[button(f'❌ {label(v)}'[:60], f'x:{tag}:{i}:{short_hash(v)}')] for i, v in enumerate(values[:90])]
+            text += '\n\n🗑 বাদ দিতে নিচের নামের পাশের ❌ বাটনে চাপুন।'
+            buttons = rows + buttons
+        await self.send(event, text, buttons)
 
     async def action(self, event, name, value):
         if name in ('addchannel', 'delchannel', 'setdest'):
@@ -176,6 +185,18 @@ class AdminControls:
             self.pending.pop(event.sender_id, None)
             if kind == 'p' and name in PROMPTS: return await self.prompt(event, name)
             if kind == 'a': return await self.show(event, name)
+            if kind == 'x':
+                tag, idx, fp = (name.split(':') + [''])[:3]
+                section = 'channels' if tag == 'c' else 'keywords'
+                values = await asyncio.to_thread(db.get_channels if tag == 'c' else db.get_keywords)
+                i = int(idx)
+                if i >= len(values) or short_hash(values[i]) != fp:
+                    await self.send(event, 'ℹ️ তালিকা বদলে গেছে, তাই কিছু বাদ দেওয়া হয়নি। নতুন তালিকা দেখুন।')
+                    return await self.show(event, section)
+                ok = await asyncio.to_thread(db.remove_channel if tag == 'c' else db.remove_keyword, values[i])
+                shown = display_channel(values[i]) if tag == 'c' else values[i]
+                await self.send(event, f'🗑 বাদ দেওয়া হয়েছে: {shown}' if ok else 'ℹ️ আগেই বাদ দেওয়া হয়েছে।')
+                return await self.show(event, section)
             if kind == 'm':
                 text = {'main': '🤖 প্রধান মেনু\nকী করতে চান, বেছে নিন।', 'channels': '📢 চ্যানেল ব্যবস্থাপনা', 'keywords': '🔑 কিওয়ার্ড ব্যবস্থাপনা', 'dest': '🎯 গন্তব্য চ্যানেল'}
                 if name not in text: return
@@ -188,5 +209,5 @@ class AdminControls:
     def register(self):
         self.bot.add_event_handler(self.on_command, events.NewMessage(pattern=r'^/(start|menu|cancel|help|channels|addchannel|delchannel|keywords|addkw|delkw|setdest|dest|test|status)(@\w+)?(\s|$)'))
         self.bot.add_event_handler(self.on_input, events.NewMessage(func=lambda e: e.is_private and not (e.raw_text or '').startswith('/')))
-        self.bot.add_event_handler(self.on_button, events.CallbackQuery(pattern=rb'^[map]:'))
+        self.bot.add_event_handler(self.on_button, events.CallbackQuery(pattern=rb'^[mapx]:'))
         return self
