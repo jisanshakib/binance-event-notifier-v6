@@ -20,11 +20,6 @@ STRICT NUMBER RULES for "reward":
   or shorten it, and never abbreviate (never "500K", "1M", "0.5M").
 - Copy the reward asset as its COMPLETE symbol: "BNB", "FDUSD", "USDT". Never
   truncate it or drop letters (never "B" for "BNB", never "F" for "FDUSD").
-- PRIORITY: a line starting with 🎁 (or labelled "Reward Pool", "Prize Pool",
-  "Total rewards") IS the reward. Prefer it over numbers in the title/header,
-  which are often truncated (title "Trade to Share Up to 2,300" + line
-  "🎁 2,300,000 FF" -> reward "2,300,000 FF").
-- Always include the token ticker after the amount ("2,300,000 FF").
 
 STRICT TOKEN RULE for "token":
 - "token" is the COMPLETE campaign token symbol exactly as written in the text
@@ -162,51 +157,8 @@ def _repair_reward(reward, candidates):
     return fixed, ai_tok, tok
 
 
-_GIFT_START = ("\U0001F381", "\U0001F4B0", "\U0001F3C6")  # 🎁 💰 🏆
-_POOL_LABEL = re.compile(r"(?i)reward\s*pool|prize\s*pool|total\s+rewards?")
-
-
-def _num_value(s):
-    try:
-        return float(_digits(str(s)).lstrip("$").strip() or 0)
-    except ValueError:
-        return 0.0
-
-
-def _gift_reward(text):
-    """Largest amount+ticker from a 🎁 / 'Reward Pool' line, or None."""
-    best = None
-    for line in (text or "").splitlines():
-        s = line.strip()
-        if not s.startswith(_GIFT_START):
-            continue
-        for m in _REWARD_PAIR.finditer(s):
-            num, tok = m.group(1).lstrip("$").strip(), m.group(2)
-            if tok.upper() not in _NOT_ASSET and (best is None or _num_value(num) > _num_value(best[0])):
-                best = (num, tok)
-    return best
-
-
-def _prefer_gift_line(data, source_text):
-    """A 🎁 reward line beats a truncated header number ('Share Up to 2,300' vs
-    '🎁 2,300,000 FF'): used when the AI gave no amount, a comma-truncated
-    version of it, or the same amount without its ticker. Unrelated AI amounts stay."""
-    gift = _gift_reward(source_text)
-    if not gift:
-        return data
-    num, tok = gift
-    reward = " ".join(str(data.get("reward") or "").split())
-    m = _REWARD_NUM.search(reward)
-    tail = _TAIL_TOKEN.match(reward[m.end():]) if m else None
-    has_tok = bool(tail and tail.group(1) and tail.group(1).upper() not in _NOT_ASSET and len(tail.group(1)) > 1)
-    if not m or _number_truncated(m.group(1), num) or (_digits(m.group(1)) == _digits(num) and not has_tok):
-        data["reward"] = f"{num} {tok}"
-    return data
-
-
 def _apply_reward_repair(data, source_text):
     """Safety net for the truncation bugs, applied to every AI result."""
-    data = _prefer_gift_line(data, source_text)
     candidates = _reward_candidates(source_text)
     if not candidates:
         return data
