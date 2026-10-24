@@ -2,7 +2,7 @@
 
 * Own tables: booster_channels, booster_keywords, booster_posts (+ settings keys prefixed "booster_").
 * Reads ONLY the Telegram post text. Never opens, fetches or scrapes any link.
-* Sends the post text to Gemini (gemini-2.5-flash) to extract token / event type / alpha points.
+* Sends the post text to Gemini (BOOSTER_GEMINI_MODEL, booster-only) to extract token / event type / alpha points.
 * Every handler is wrapped in try/except so nothing here can stop the main module.
 """
 import asyncio
@@ -110,7 +110,7 @@ RESPONSE_SCHEMA = {
         "target_name": {"type": "STRING", "nullable": True,
                         "description": "Core project/brand name of the booster campaign as written (e.g. TermMax, bStocks, Swell). No $ sign, no intro words. null when absent."},
         "reward_pool": {"type": "STRING", "nullable": True,
-                        "description": "Total reward pool exactly as written with its asset (e.g. '2,000,000 TMX', '100,000 USDC'). null when absent."},
+                        "description": "Total reward pool exactly as written with its asset (e.g. '2,000,000 TMX', '100,000 USDC'). Copy numbers with ALL their digits and commas, never abbreviate (no K/M) and never truncate the asset symbol. null when absent."},
         "alpha_points": {"type": "INTEGER", "nullable": True,
                          "description": "Plain integer Binance Alpha Points requirement (2 for '2+ Alpha Points'). null when absent."},
         "event_type": {"type": "STRING", "nullable": True,
@@ -147,6 +147,10 @@ with boilerplate words.
 2. reward_pool — the total reward pool, exactly as written with its amount and
    asset, e.g. "2,000,000 TMX", "100,000 USDC", "$50,000 worth of FLAP".
    - Use the total pool, not a per-user amount, if both appear.
+   - Copy the amount with ALL its digits and commas exactly as written
+     ("1,000,000"); never round, shorten or abbreviate it (never "1M", "500K"),
+     and never drop digits by splitting the number at a comma.
+   - Copy the asset as its COMPLETE symbol ("BNB", "FDUSD" — never "B", "F").
    - If no reward amount is stated, return null.
 
 3. alpha_points — the Binance Alpha Points requirement as a plain integer.
@@ -188,14 +192,41 @@ For every other field, return "N/A" or null when it is not clearly stated.
 
 _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
+# Booster-only model. Deliberately NOT config.GEMINI_MODEL, so the main
+# announcement pipeline (ai_formatter.py) is never affected by this setting.
+# Override with the BOOSTER_GEMINI_MODEL env var; on 404 we fall back in order.
+BOOSTER_GEMINI_MODEL = os.environ.get("BOOSTER_GEMINI_MODEL") or "gemini-3.8-flash"
+_BOOSTER_FALLBACK_MODELS = ["gemini-flash-latest", "gemini-2.5-flash"]
+_active_model = None
+
+
+def _models_to_try():
+    seen, out = set(), []
+    for m in ([_active_model] if _active_model else []) + [BOOSTER_GEMINI_MODEL] + _BOOSTER_FALLBACK_MODELS:
+        if m and m not in seen:
+            seen.add(m); out.append(m)
+    return out
+
 
 async def _gemini_call(prompt, schema):
+    global _active_model
+    r = None
+    for model in _models_to_try():
+        r = await _gemini_post(model, prompt, schema)
+        if r.status_code != 404:
+            _active_model = model
+            return r
+        print(f"Booster: Gemini model {model} returned 404, trying next")
+    return r
+
+
+async def _gemini_post(model, prompt, schema):
     gen = {"temperature": 0, "responseMimeType": "application/json"}
     if schema:
         gen["responseSchema"] = RESPONSE_SCHEMA
     async with httpx.AsyncClient(timeout=27) as client:
         return await client.post(
-            _GEMINI_URL.format(model=config.GEMINI_MODEL),
+            _GEMINI_URL.format(model=model),
             headers={"x-goog-api-key": config.GEMINI_API_KEY, "Content-Type": "application/json"},
             json={"systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
                   "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -302,7 +333,7 @@ def clean_reward(v):
     v = " ".join(str(v or "").split()).strip(" .,:;")
     if not v or v.casefold() in ("n/a", "na", "none", "null", "unknown") or not re.search(r"[0-9]", v):
         return ""
-    return v[:60]
+    return v[:120]
 
 
 def fallback_reward(text):
@@ -611,7 +642,7 @@ class Booster:
             ch, kw = await asyncio.gather(asyncio.to_thread(get_channels), asyncio.to_thread(get_keywords))
             d = await asyncio.to_thread(get_destination)
             on = await asyncio.to_thread(is_enabled)
-            return await self.send(event, f'📊 বুস্টার ক্যাম্পেইনের অবস্থা\n{"✅ চালু" if on else "⏸ বন্ধ"}\nচ্যানেল: {len(ch)}টি\nকিওয়ার্ড: {len(kw)}টি\nগন্তব্য: {display_channel(d) if d else "ঠিক করা হয়নি"}\nAI: Gemini ({config.GEMINI_MODEL})', [_home()])
+            return await self.send(event, f'📊 বুস্টার ক্যাম্পেইনের অবস্থা\n{"✅ চালু" if on else "⏸ বন্ধ"}\nচ্যানেল: {len(ch)}টি\nকিওয়ার্ড: {len(kw)}টি\nগন্তব্য: {display_channel(d) if d else "ঠিক করা হয়নি"}\nAI: Gemini ({_active_model or BOOSTER_GEMINI_MODEL})', [_home()])
         await self.send(event, '🚀 বুস্টার ক্যাম্পেইন\nকী করতে চান, বেছে নিন।', menu())
 
     async def action(self, event, name, value):

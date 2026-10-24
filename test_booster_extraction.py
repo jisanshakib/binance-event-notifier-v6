@@ -26,7 +26,7 @@ class ExtractionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(B.httpx, 'AsyncClient', Client):
             response = await B.ask_gemini('post')
         self.assertEqual(json.loads(response)['target_name'], 'SWELL')
-        self.assertTrue(requests[0][0].endswith('gemini-2.5-flash:generateContent'))
+        self.assertTrue(requests[0][0].endswith(B.BOOSTER_GEMINI_MODEL + ':generateContent'))
         generation = requests[0][1]['generationConfig']
         self.assertEqual(generation['responseMimeType'], 'application/json')
         self.assertEqual(set(generation['responseSchema']['required']), {'target_name', 'reward_pool', 'event_type', 'alpha_points'})
@@ -347,3 +347,27 @@ def test_schema_rejected_retries_without_schema():
     finally:
         booster._gemini_call = orig
     assert calls == [True, False]
+
+
+def test_booster_model_falls_back_on_404_and_main_model_untouched():
+    import asyncio, booster
+    import config
+    calls = []
+
+    class R:
+        def __init__(self, code): self.status_code, self.text = code, ""
+
+    async def fake_post(model, prompt, schema):
+        calls.append(model)
+        return R(404 if model == booster.BOOSTER_GEMINI_MODEL else 200)
+
+    orig_post, orig_active = booster._gemini_post, booster._active_model
+    booster._gemini_post, booster._active_model = fake_post, None
+    try:
+        r = asyncio.run(booster._gemini_call("p", True))
+        assert r.status_code == 200
+        assert calls == [booster.BOOSTER_GEMINI_MODEL, "gemini-flash-latest"]
+        assert booster._active_model == "gemini-flash-latest"
+        assert config.GEMINI_MODEL == "gemini-2.5-flash"  # main pipeline unchanged
+    finally:
+        booster._gemini_post, booster._active_model = orig_post, orig_active
