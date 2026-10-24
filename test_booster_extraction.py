@@ -121,7 +121,7 @@ class ExtractionTests(unittest.IsolatedAsyncioTestCase):
         async def fail(prompt): raise RuntimeError('offline')
         with patch.object(B, 'ask_gemini', fail):
             d = await B.extract('$SWELL Booster requires 61 Alpha Points')
-        self.assertEqual(d, {'token': 'SWELL', 'event_type': '', 'alpha_points': '61'})
+        self.assertEqual(d, {'token': 'SWELL', 'event_type': '', 'alpha_points': '61', 'reward': ''})
 
     async def test_malformed_or_non_object_json_uses_fallback(self):
         for answer in ('not JSON', 'null', '[]', '{broken', '```json\n{}\n```'):
@@ -212,3 +212,36 @@ def test_post_without_any_name_still_gets_clean_header():
     d = _run_extract("{}", "🚀🚀🚀\nhttps://x.com")
     assert d["token"] == ""
     assert booster.build_post(d).startswith("BinanceWallet Booster Campaign")
+
+
+# ---- real post: bStocks x Flap (2+ Alpha Points, deduct 2 points, 100,000 USDC) ----
+FLAP = ("Participate in bStocks x Flap Booster Campaign to share 100,000 USDC in rewards!\n"
+        "Binance users with 2+ Alpha Points are eligible to participate. "
+        "Participation will deduct 2 points to participate in the event.")
+
+
+def test_flap_points_when_gemini_down():
+    d = _run_extract(None, FLAP)
+    assert d["alpha_points"] == "2" and d["token"] == "bStocks x Flap" and d["reward"] == "100,000 USDC"
+
+
+def test_flap_points_when_gemini_returns_2_plus():
+    assert _run_extract('{"target_name":"bStocks x Flap","alpha_points":"2+"}', FLAP)["alpha_points"] == "2"
+
+
+def test_flap_points_when_gemini_says_na():
+    assert _run_extract('{"alpha_points":"N/A"}', FLAP)["alpha_points"] == "2"
+
+
+def test_deduct_points_only():
+    assert _run_extract(None, "ENA Booster. Will deduct 3 points.")["alpha_points"] == "3"
+
+
+def test_reward_amount_is_never_the_points():
+    assert _run_extract(None, "ENA Booster: win 500 USDC, 100 winners")["alpha_points"] == "N/A"
+
+
+def test_reward_line_only_when_present():
+    import booster
+    assert "🎁Reward Pool: 100,000 USDC" in booster.build_post(_run_extract(None, FLAP))
+    assert "Reward" not in booster.build_post(_run_extract(None, "ENA Booster, 2 Alpha Points"))

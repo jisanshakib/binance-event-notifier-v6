@@ -111,7 +111,10 @@ RESPONSE_SCHEMA = {
         "event_type": {"type": "STRING", "nullable": True,
                        "enum": ["FCFS users Event", "All user Event", ""],
                        "description": "Only an explicitly stated audience type; null or empty when absent."},
-        "alpha_points": {"type": "STRING", "description": "Exact integer Alpha Points requirement as a string, or N/A when absent."},
+        "alpha_points": {"type": "INTEGER", "nullable": True,
+                         "description": "Plain integer Alpha Points requirement (2 for '2+ Alpha Points'); null when absent."},
+        "reward": {"type": "STRING", "nullable": True,
+                   "description": "Total reward pool exactly as written, e.g. '100,000 USDC'; null when absent."},
     },
     "required": ["target_name", "event_type", "alpha_points"],
 }
@@ -136,10 +139,18 @@ Return a JSON object matching the supplied schema with exactly these fields:
   first heading such as "Swell x Binance Wallet"), without emojis or filler
   words like New, Live, Binance Wallet, Booster, Campaign.
   Only if no name appears anywhere in the post, return "N/A"; never invent it.
-- alpha_points: the exact dynamic integer associated with the Alpha Points
-  eligibility requirement, e.g. "1", "2", "61", or any other stated integer.
-  Do not substitute reward amounts, dates, participant counts or an example number.
-  If no Alpha Points requirement is stated, return "N/A".
+- alpha_points: the plain integer Alpha Points needed to join, as a JSON number.
+  Scan for every way it can be written, for example:
+    "2+ Alpha Points" -> 2, "with 2+ Alpha Points are eligible" -> 2,
+    "at least 15 Alpha Points" -> 15, "minimum of 61 points" -> 61,
+    "Alpha Points requirement: 61" -> 61, "will deduct 2 points" -> 2,
+    "consume 3 Alpha Points" -> 3, "≥ 5 Alpha Points" -> 5.
+  Drop symbols like +, ≥, > and words like "points". Prefer the eligibility
+  number; use the deducted/consumed number only if no eligibility number exists.
+  Never use reward amounts (e.g. 100,000 USDC), dates, participant counts or
+  an example number. If no Alpha Points requirement is stated, return null.
+- reward: the total reward pool exactly as written (e.g. "100,000 USDC",
+  "$50,000 in FLAP"), or null if no reward amount is stated.
 - event_type: "FCFS users Event" ONLY if FCFS / first-come-first-served is
   explicitly stated; "All user Event" ONLY if all users is explicitly stated.
   Otherwise return null or "". Do not guess from points, availability or rewards.
@@ -192,17 +203,58 @@ def fallback_event_type(text):
 
 
 def normalize_points(v):
-    value = str(v if v is not None else "").strip()
-    return str(int(value)) if re.fullmatch(r"[0-9]+", value) else "N/A"
+    """Accept 2, "2", "2+", "≥2", "2 points", "at least 2 Alpha Points", 2.0 -> "2"; otherwise N/A."""
+    if isinstance(v, bool) or v is None:
+        return "N/A"
+    if isinstance(v, (int, float)):
+        return str(int(v)) if v >= 0 and float(v).is_integer() else "N/A"
+    value = re.sub(r"(?<=[0-9]),(?=[0-9]{3}\b)", "", str(v).strip())
+    m = re.fullmatch(r"(?i)(?:at\s+least|min(?:imum)?(?:\s+of)?|[≥>]=?)?\s*([0-9]{1,6})(?:\.0+)?\s*\+?\s*(?:(?:binance\s+)?(?:alpha\s+)?points?)?", value)
+    return str(int(m.group(1))) if m else "N/A"
+
+
+_PTS_NUM = r"(?<![\w.,$-])([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,6})(?![.,][0-9])"
+_PTS_SYM = r"\s*(?:\+|plus|or\s+more)?\s*"
 
 
 def fallback_points(text):
-    # Support both '61 Alpha Points' and 'Alpha Points requirement: 61'.
-    label = r"(?:Binance\s+)?Alpha\s+Points?"
-    before = re.search(r"(?<![\w.,-])([0-9]+)\s*" + label + r"\b", text or "", re.I)
-    after = re.search(r"\b" + label + r"\s*(?:(?:requirement|required|threshold|of|at\s+least|minimum|min)\s*[:=–-]?\s*)*[:=–-]?\s*([0-9]+)(?![\w.,])", text or "", re.I)
-    m = before or after
-    return normalize_points(m.group(1)) if m else "N/A"
+    """Local scan used when Gemini gives nothing usable. Eligibility wording wins over deductions."""
+    t = text or ""
+    label = r"(?:Binance\s+)?Alpha\s+Points?\b"
+    qual = r"(?:at\s+least|minimum(?:\s+of)?|min\.?|[≥>]=?|over|above|more\s+than)\s*"
+    patterns = [
+        _PTS_NUM + _PTS_SYM + label,                                              # 2+ Alpha Points / 61 Alpha Points
+        r"\b" + label + r"\s*(?:(?:requirement|required|threshold|of|at\s+least|minimum|min)\s*[:=–-]?\s*)*[:=–-]?\s*[≥>]?=?\s*"
+        + r"([0-9]{1,6})(?![\w.,])",                                              # Alpha Points requirement: 61
+        qual + r"([0-9]{1,6})" + _PTS_SYM + r"points?\b",                          # at least 15 points
+        r"(?:deduct(?:s|ed|ing)?|consum(?:e|es|ed|ing)|cost(?:s)?|spend(?:s)?|use(?:s)?)\s+"
+        + r"([0-9]{1,6})" + _PTS_SYM + r"(?:alpha\s+)?points?\b",                 # deduct 2 points
+        _PTS_NUM + _PTS_SYM + r"points?\b",                                        # any '2 points' as a last resort
+    ]
+    for p in patterns:
+        m = re.search(p, t, re.I)
+        if m:
+            return normalize_points(m.group(1).replace(",", ""))
+    return "N/A"
+
+
+def clean_reward(v):
+    v = " ".join(str(v or "").split()).strip(" .,:;")
+    if not v or v.casefold() in ("n/a", "na", "none", "null", "unknown") or not re.search(r"[0-9]", v):
+        return ""
+    return v[:60]
+
+
+def fallback_reward(text):
+    amount = r"(\$?\s?[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|\$?\s?[0-9]+(?:\.[0-9]+)?\s?[KkMm]?)"
+    asset = r"\s*(?:worth\s+of\s+|in\s+)?(\$?[A-Z][A-Za-z0-9]{1,9})"
+    for line in (text or "").splitlines():
+        if not re.search(r"(?i)reward|prize|pool|share|airdrop|giveaway", line):
+            continue
+        m = re.search(amount + asset + r"\b", line)
+        if m and not re.fullmatch(r"(?i)alpha|points?|users?|participants?|winners?", m.group(2).lstrip("$")):
+            return clean_reward(f"{m.group(1).strip()} {m.group(2)}")
+    return ""
 
 
 def clean_token(v):
@@ -235,8 +287,10 @@ def fallback_target(text):
         return ""
     # Mixed-case names written right before Booster/Campaign, e.g. "Swell Booster Campaign".
     generic = {"binance", "wallet", "the", "new", "this", "our", "a", "an", "alpha", "web3", "keyless", "booster", "campaign"}
-    names = [n for n in re.findall(r"(?<![\w$#])([A-Z][A-Za-z0-9-]{1,30})(?=[ \t]+(?:Booster|Campaign)\b)", text)
-             if n.casefold() not in generic and re.search(r"[a-z]", n)]  # all-caps words are handled above
+    # Also keeps collaborations whole: "bStocks x Flap Booster Campaign" -> "bStocks x Flap".
+    word = r"[A-Za-z][A-Za-z0-9-]{1,30}"
+    names = [n for n in re.findall(r"(?<![\w$#])((?:" + word + r"[ \t]+(?:x|X|×|&)[ \t]+)*" + word + r")(?=[ \t]+(?:Booster|Campaign)\b)", text)
+             if n.split()[-1].casefold() not in generic and re.search(r"[a-z]", n) and re.search(r"[A-Z]", n)]
     names = list(dict.fromkeys(names))
     return names[0] if len(names) == 1 else ""
 
@@ -291,7 +345,8 @@ async def extract(text):
     # new Gemini field name; Gemini itself only returns target_name.
     return {"token": target,
             "event_type": normalize_event_type(data.get("event_type"), text) or fallback_event_type(text),
-            "alpha_points": points}
+            "alpha_points": points,
+            "reward": clean_reward(data.get("reward")) or fallback_reward(text)}
 
 
 def build_post(d):
@@ -303,7 +358,8 @@ def build_post(d):
         header += f" ~ {d['event_type']}"
     return (f"{header} 🔥✔️\n\n"
             "🟢Entry: Binance Wallet App → Homepage Banner or Discover → Booster\n\n"
-            f"⚡️Eligibility: Binance Keyless Wallet users with at least {d.get('alpha_points') or 'N/A'} Binance Alpha Points")
+            f"⚡️Eligibility: Binance Keyless Wallet users with at least {d.get('alpha_points') or 'N/A'} Binance Alpha Points"
+            + (f"\n\n🎁Reward Pool: {d['reward']}" if d.get("reward") else ""))
 
 
 # ---------------------------------------------------------------- Bengali UI
