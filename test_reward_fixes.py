@@ -125,3 +125,27 @@ def test_booster_clean_reward_keeps_full_comma_number():
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__]))
+
+
+# Bug 3: truncated header number chosen over the full 🎁 reward line.
+FF_POST = ("🛒Spot Trading Tournament Season 6: Trade to Share Up to 2,300\n"
+           "🎁 2,300,000 FF\n🎉 For All User")
+
+
+def _ff(reward):
+    import json
+    return format_with(json.dumps({"title": "Spot Trading Tournament S6", "reward": reward,
+                                   "eligibility": "For All User", "token": "FF", "pair": "USDT"}),
+                       FF_POST, {"text": ""})
+
+
+def test_gift_line_beats_truncated_header():
+    for r in ["Trade to Share Up to 2,300", "Up to 2,300", "2,300 FF", "", "2,300,000 FF"]:
+        out = _ff(r)
+        assert "2,300,000 FF" in out, (r, out)
+        assert "2,300**" not in out and "2,300 " not in out.replace("2,300,000", "")
+
+
+def test_ai_reward_kept_when_it_matches_gift_line():
+    d = A._apply_reward_repair({"reward": "Get Up to 400 BNB"}, "🎁 400 BNB\nTrade now")
+    assert d["reward"] == "Get Up to 400 BNB"
