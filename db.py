@@ -2,6 +2,7 @@
 import threading
 import psycopg
 import config
+from channel_refs import normalize_channel
 
 SCHEMA = """
 create table if not exists source_channels (id bigserial primary key, username text unique not null, created_at timestamptz default now());
@@ -56,11 +57,7 @@ def init_schema():
 
 
 def _norm(ch: str) -> str:
-    ch = (ch or "").strip()
-    for p in ("https://t.me/", "http://t.me/", "t.me/", "@"):
-        if ch.startswith(p):
-            ch = ch[len(p):]
-    return ch.strip("/").lower()
+    return normalize_channel(ch)
 
 
 def _clean_kw(w: str) -> str:

@@ -27,6 +27,14 @@ def _install_fake_db(db):
     d = FAKE.data
     def kws(): return d.setdefault("keywords", [])
     db.get_channels = lambda: [r["username"] for r in d.setdefault("source_channels", [])]
+    def add_channel(c):
+        c = db._norm(c)
+        if c not in db.get_channels(): d.setdefault("source_channels", []).append({"username": c})
+    def remove_channel(c):
+        c = db._norm(c); old = len(db.get_channels())
+        d["source_channels"] = [r for r in d.setdefault("source_channels", []) if r["username"] != c]
+        return len(db.get_channels()) < old
+    db.add_channel, db.remove_channel = add_channel, remove_channel
     db.get_keywords = lambda: [r["word"] for r in kws()]
     def add_keyword(w):
         w = db._clean_kw(w)
@@ -86,7 +94,7 @@ def run(c): return asyncio.get_event_loop().run_until_complete(c) if False else 
 
 
 def reset():
-    FAKE.data.clear(); SENT.clear(); AI_CALLS.clear()
+    FAKE.data.clear(); SENT.clear(); AI_CALLS.clear(); main.controls.pending.clear()
     db.set_setting("destination", "@dest")
 
 
@@ -168,15 +176,10 @@ def test_no_destination_does_not_crash_or_claim():
 
 
 def test_unauthorized_blocked():
-    replies = []
-    called = []
-    @main.admin_only
-    async def h(e): called.append(1)
-    async def reply(t): replies.append(t)
-    run(h(types.SimpleNamespace(sender_id=999, reply=reply)))
-    assert replies == ["⛔️ Unauthorized"] and called == []
-    run(h(types.SimpleNamespace(sender_id=42, reply=reply)))
-    assert called == [1]
+    reset()
+    e = AdminEvent('/addkw bad', sender=999)
+    run(main.controls.on_command(e))
+    assert db.get_keywords() == [] and e.answers
 
 
 def test_command_patterns():
@@ -239,6 +242,151 @@ def test_binance_link_placeholders_and_entities():
              ("Join Now", "https://www.%suffixOrigin%/activity/x")]
     assert scraper.pick_cta(links, "f") == "https://www.binance.com/activity/x"
     assert scraper._clean_text("Hello&nbsp;World") == "Hello World"
+
+
+class AdminEvent:
+    def __init__(self, text='', data=b'', sender=42):
+        self.sender_id, self.chat_id, self.is_private = sender, sender, True
+        self.raw_text, self.data = text, data
+        self.replies, self.edits, self.answers = [], [], []
+    async def reply(self, text, **kw): self.replies.append((text, kw))
+    async def respond(self, text, **kw): self.replies.append((text, kw))
+    async def edit(self, text, **kw): self.edits.append((text, kw))
+    async def answer(self, *a, **kw): self.answers.append((a, kw))
+
+
+class UserDouble:
+    def __init__(self): self.joins, self.reads = [], []
+    async def __call__(self, request): self.joins.append(request.channel)
+    async def get_messages(self, channel, ids):
+        self.reads.append((channel, ids))
+        return msg(ids, 'Tournament https://www.binance.com/en/support/announcement/abc')
+
+
+def test_channel_input_forms():
+    from channel_refs import normalize_channel, telegram_entity
+    for v in ['https://t.me/ChannelName', 't.me/channelname', '@channelname', 'channelname']:
+        assert normalize_channel(v) == 'channelname'
+    assert normalize_channel('-100123456') == '-100123456'
+    assert normalize_channel('123456') == '-100123456'
+    assert telegram_entity('-100123456') == -100123456
+    for v in ['https://evil.test/channelname', 't.me/channelname/123', 't.me/+invite', '', '0']:
+        try: normalize_channel(v)
+        except ValueError: pass
+        else: raise AssertionError(v)
+
+
+def test_manual_post_link_validation():
+    from channel_refs import parse_post_link
+    assert parse_post_link('t.me/channelname/123?single') == ('channelname', 123)
+    assert parse_post_link('https://t.me/c/123456/789') == (-100123456, 789)
+    for v in ['https://evil.test/channelname/123', 't.me/channelname/0', 't.me/channelname']:
+        try: parse_post_link(v)
+        except ValueError: pass
+        else: raise AssertionError(v)
+
+
+def test_button_channel_and_keyword_crud_round_trip():
+    reset(); c = main.controls; original = c.user; double = UserDouble(); c.user = double
+    async def flow():
+        start = AdminEvent('/start'); await c.on_command(start)
+        assert len(start.replies[0][1]['buttons']) == 3
+        await c.on_button(AdminEvent(data=b'm:channels'))
+        await c.on_button(AdminEvent(data=b'p:addchannel'))
+        await c.on_input(AdminEvent('https://t.me/ChannelName'))
+        assert db.get_channels() == ['channelname'] and double.joins == ['channelname']
+        listed = AdminEvent(data=b'a:channels'); await c.on_button(listed)
+        assert '@channelname' in listed.replies[0][0]
+        await c.on_button(AdminEvent(data=b'p:delchannel'))
+        await c.on_input(AdminEvent('t.me/channelname'))
+        assert db.get_channels() == []
+        await c.on_button(AdminEvent(data=b'p:addkw'))
+        await c.on_input(AdminEvent('  Tournament  '))
+        assert db.get_keywords() == ['Tournament']
+        await c.on_button(AdminEvent(data=b'p:delkw'))
+        await c.on_input(AdminEvent('tournament'))
+        assert db.get_keywords() == []
+    try: run(flow())
+    finally: c.user = original
+
+
+def test_destination_button_stores_canonical_link():
+    reset(); c = main.controls; old_me, old_perms = c.bot.get_me, c.bot.get_permissions; checked = []
+    async def me(): return object()
+    async def perms(ent, account):
+        checked.append(ent); return types.SimpleNamespace(is_admin=True, post_messages=True)
+    c.bot.get_me, c.bot.get_permissions = me, perms
+    async def flow():
+        await c.on_button(AdminEvent(data=b'p:setdest'))
+        await c.on_input(AdminEvent('https://t.me/OutputChannel'))
+        assert db.get_setting('destination') == 'outputchannel' and checked == ['outputchannel']
+        checked.clear()
+        await c.on_command(AdminEvent('/setdest -100123456'))
+        assert db.get_setting('destination') == '-100123456' and checked == [-100123456]
+    try: run(flow())
+    finally: c.bot.get_me, c.bot.get_permissions = old_me, old_perms
+
+
+def test_buttons_authorization_and_pending_cancellation():
+    reset(); c = main.controls
+    async def flow():
+        denied = AdminEvent(data=b'p:addkw', sender=999); await c.on_button(denied)
+        assert denied.answers and not c.pending
+        await c.on_button(AdminEvent(data=b'p:addkw'))
+        await c.on_input(AdminEvent('bad', sender=999))
+        assert db.get_keywords() == [] and 42 in c.pending
+        await c.on_command(AdminEvent('/cancel'))
+        await c.on_input(AdminEvent('ignored'))
+        assert not c.pending and db.get_keywords() == []
+        await c.on_button(AdminEvent(data=b'p:addkw'))
+        await c.on_button(AdminEvent(data=b'a:status'))
+        assert not c.pending
+        import time
+        c.pending[42] = ('addkw', time.monotonic() - 601)
+        await c.on_input(AdminEvent('expired'))
+        assert db.get_keywords() == []
+    run(flow())
+
+
+def test_keyword_maximum_100_characters_through_menu():
+    reset(); c = main.controls
+    async def flow():
+        await c.on_button(AdminEvent(data=b'p:addkw')); await c.on_input(AdminEvent('x' * 101))
+        assert db.get_keywords() == []
+        await c.on_button(AdminEvent(data=b'p:addkw')); await c.on_input(AdminEvent('x' * 100))
+        assert db.get_keywords() == ['x' * 100]
+    run(flow())
+
+
+def test_menu_manual_test_publishes_and_records_result():
+    reset(); c = main.controls; old = c.user; double = UserDouble(); c.user = double
+    async def flow():
+        await c.on_button(AdminEvent(data=b'p:test'))
+        await c.on_input(AdminEvent('t.me/c/123456/789'))
+        assert double.reads == [(-100123456, 789)]
+        assert FAKE.data['processed_posts'][0]['status'] == 'posted'
+        assert len(SENT) == 1 and SENT[0][0] == 'dest'
+    try: run(flow())
+    finally: c.user = old
+
+
+def test_manual_test_failure_is_not_reported_as_success():
+    reset(); c = main.controls; old = c.user; c.user = UserDouble()
+    async def flow():
+        FAKE.data['settings'] = []
+        e = AdminEvent('/test t.me/channelname/123'); await c.on_command(e)
+        assert FAKE.data.get('processed_posts', []) == []
+        assert e.replies[-1][0].startswith('❌')
+    try: run(flow())
+    finally: c.user = old
+
+
+def test_channel_list_is_not_cut_off():
+    reset()
+    for i in range(400): db.add_channel('channel_' + str(i))
+    e = AdminEvent(data=b'a:channels'); run(main.controls.on_button(e))
+    assert all(len(t.encode('utf-16-le')) // 2 <= 4096 for t, _ in e.replies)
+    assert '@channel_399' in ''.join(t for t, _ in e.replies)
 
 
 if __name__ == "__main__":
